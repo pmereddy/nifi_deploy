@@ -1,0 +1,8 @@
+#!/bin/bash
+
+export NIFI_HOST=
+export NIFI_PORT=8443
+export NIFI_REGISTRY_HOST=
+export NIFI_REGISTRY_PORT=18433
+export KERBEROS_PRINCIPAL=
+export KERBEROS_KEYTAB=
