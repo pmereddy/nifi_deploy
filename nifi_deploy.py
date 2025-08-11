@@ -607,6 +607,9 @@ def parser():
     p = argparse.ArgumentParser(description="NiFi / NiFi-Registry deploy CLI")
     p.add_argument("--nifi-url", required=True)
     p.add_argument("--registry-url", required=True)
+    p.add_argument("--site-role", choices=["active", "passive"], default="active",
+               help="Site role: active starts flow & services; passive leaves them stopped")
+
 
     grp = p.add_mutually_exclusive_group()
     grp.add_argument("--principal")
@@ -726,11 +729,16 @@ def main():
 
         # Bind PC to PG
         nifi_bind_pc(nifi, pg_id, pc_id, nifi_hdr, ssl)
-        # Enable controller services
-        enable_controller_services(nifi, pg_id, nifi_hdr, ssl, 2, 30)
-        # Start the process group
-        nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
-        return
+
+	if args.site_role == "active":
+	    # Enable controller services
+	    enable_controller_services(nifi, pg_id, nifi_hdr, ssl, 2, 30)
+	    # Start the process group
+	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
+	else:
+	    LOG.info("Passive site: skipping controller-services enable and flow start.")
+	return
+
 
     # -- upgrade-flow --------------------------------------------------------
     if args.cmd == "upgrade-flow":
@@ -778,8 +786,12 @@ def main():
             nifi_hdr,
             ssl,
         )
-        nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
-        return
+	if args.site_role == "active":
+	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
+	else:
+	    LOG.info("Passive site: leaving process group STOPPED after upgrade.")
+	return
+
 
     if args.cmd == "update-pc":
         pc_id = nifi_pc_id(nifi, args.name, nifi_hdr, ssl)
