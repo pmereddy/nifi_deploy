@@ -737,9 +737,7 @@ def main():
         pg_id = nifi_search_pg(nifi, args.name, nifi_hdr, ssl)
         if not pg_id:
             raise DeployError("PG not found")
-        stat = _http(
-            "get", nifi + "/versions/process-groups/" + pg_id, nifi_hdr, verify_ssl=ssl
-        )
+        stat = _http( "get", nifi + "/versions/process-groups/" + pg_id, nifi_hdr, verify_ssl=ssl)
 
         vci = stat["versionControlInformation"]
         target = args.version or reg_latest_version(
@@ -754,7 +752,7 @@ def main():
 
         # Update parameter context
         if args.param_file:
-            # identify parameter context bound to this PG
+            # Identify parameter context bound to this PG
             bound_pc = _http(
                 "get", nifi + "/process-groups/" + pg_id, nifi_hdr, verify_ssl=ssl
             )["component"]["parameterContext"]
@@ -809,6 +807,7 @@ def main():
         new_state = "RUNNING" if args.cmd == "start-flow" else "STOPPED"
         nifi_schedule_pg(nifi, pg_id, new_state, nifi_hdr, ssl)
         return
+
 
 if __name__ == "__main__":
     try:
