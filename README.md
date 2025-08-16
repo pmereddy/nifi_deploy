@@ -1,7 +1,7 @@
 # NiFi Deploy Process Group using NiFi registry
 This project supports deploying NiFi Process Group into a live NiFi cluster using NiFi registry
 
-# Pre-requesites
+# Pre-requisites
 - A live NiFi cluster
 - A live NiFi registry
 - A user with access to REST API to create buckets, perform deployments, create parameter contexts, etc.
