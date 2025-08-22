@@ -342,8 +342,7 @@ def nifi_search_pg(nifi, name, hdr, ssl):
             return hit["id"]
     return None
 
-
-def nifi_schedule_pg(nifi, pg_id, state, hdr, ssl):
+def nifi_schedule_pg(nifi, pg_id, state, hdr, ssl, retries=0, wait_secs=3):
     _http(
         "put",
         nifi + "/flow/process-groups/" + pg_id,
@@ -352,6 +351,43 @@ def nifi_schedule_pg(nifi, pg_id, state, hdr, ssl):
         verify_ssl=ssl,
     )
     LOG.info("Process-group %s set to %s", pg_id, state)
+
+    if state != "RUNNING" or retries <= 0:
+        return
+
+    for attempt in range(1, retries + 1):
+        time.sleep(wait_secs)
+        st = _http(
+            "get",
+            f"{nifi}/flow/process-groups/{pg_id}/status",
+            hdr,
+            verify_ssl=ssl,
+        )
+        agg = (st.get("processGroupStatus") or {}).get("aggregateSnapshot") or {}
+        stopped  = int(agg.get("stoppedCount", 0) or 0)
+        invalid  = int(agg.get("invalidCount", 0) or 0)
+        disabled = int(agg.get("disabledCount", 0) or 0)
+
+        if stopped == 0 and invalid == 0 and disabled == 0:
+            LOG.info("PG %s is fully RUNNING (no stopped/invalid/disabled components).", pg_id)
+            return
+
+        LOG.info(
+            "PG %s start check (attempt %d/%d): stopped=%d invalid=%d disabled=%d -> retry RUNNING",
+            pg_id, attempt, retries, stopped, invalid, disabled,
+        )
+        _http(
+            "put",
+            nifi + "/flow/process-groups/" + pg_id,
+            hdr,
+            {"id": pg_id, "state": "RUNNING"},
+            verify_ssl=ssl,
+        )
+
+    LOG.warning(
+        "PG %s: some components remained stopped/invalid/disabled after %d retries. Inspect NiFi UI.",
+        pg_id, retries,
+    )
 
 
 def nifi_create_pg_from_registry(
@@ -896,7 +932,7 @@ def main():
 	    # Enable controller services
 	    enable_controller_services(nifi, pg_id, nifi_hdr, ssl, 2, 30)
 	    # Start the process group
-	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
+	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl ,retries=6, wait_secs=5)
 	else:
 	    LOG.info("Passive site: skipping controller-services enable and flow start.")
 	return
@@ -918,7 +954,7 @@ def main():
             return
 
         # Stop the PG
-        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl)
+        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl,retries=6, wait_secs=5)
 
         # Update parameter context
         if args.param_file:
@@ -949,7 +985,7 @@ def main():
             ssl,
         )
 	if args.site_role == "active":
-	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl)
+	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl,retries=6, wait_secs=5)
 	else:
 	    LOG.info("Passive site: leaving process group STOPPED after upgrade.")
 	return
@@ -979,7 +1015,7 @@ def main():
         if not pg_id:
             raise DeployError("PG not found")
         new_state = "RUNNING" if args.cmd == "start-flow" else "STOPPED"
-        nifi_schedule_pg(nifi, pg_id, new_state, nifi_hdr, ssl)
+        nifi_schedule_pg(nifi, pg_id, new_state, nifi_hdr, ssl,retries=6, wait_secs=5)
         return
 
     # -- cleanup -------------------------------------------------------------
@@ -995,7 +1031,7 @@ def main():
             LOG.warning("Could not fully disable controller services before stopping PG (%s). Proceeding to stop PG, then retry.", e)
 
         # 2) Stop the process group
-        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl)
+        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl,retries=6, wait_secs=5)
 
         # 2b) Retry CS disable in case referencing components prevented it earlier
         try:
