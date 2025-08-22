@@ -222,6 +222,27 @@ def reg_latest_version(reg, bucket_id, flow_id, hdr, ssl):
     return data["snapshotMetadata"]["version"]
 
 
+def reg_delete_bucket_by_name(reg, bucket_name, hdr, ssl):
+    """
+    Delete the NiFi Registry bucket whose name == bucket_name.
+    Uses revision.version from /buckets.
+    """
+    buckets = _http("get", reg + "/buckets", hdr, verify_ssl=ssl)
+    target = None
+    for b in buckets:
+        if b.get("name") == bucket_name:
+            target = b
+            break
+    if not target:
+        LOG.warning("No registry bucket named '%s' found; skipping delete", bucket_name)
+        return
+    bucket_id = target["identifier"]
+    version = (target.get("revision") or {}).get("version", 0)
+    LOG.info("Deleting registry bucket '%s' (id=%s, rev=%s)", bucket_name, bucket_id, version)
+    _http("delete", f"{reg}/buckets/{bucket_id}?version={version}", hdr, verify_ssl=ssl)
+    LOG.info("Registry bucket '%s' deleted", bucket_name)
+
+
 # ---------- NiFi helpers ----------------------------------------------------
 # Update parameter context
 def nifi_update_pc(nifi, pc_id, params, hdr, ssl=True, poll_secs=2, timeout=300):
@@ -570,6 +591,77 @@ def enable_controller_services(nifi, pg_id, hdr, verify_ssl=True, poll_secs=2, t
         time.sleep(poll_secs)
 
 
+# --- Disable controller services for a PG (includes descendants)
+def disable_controller_services(nifi, pg_id, hdr, verify_ssl=True, poll_secs=2, timeout_secs=120):
+    LOG.info("Disabling controller-services in PG %s …", pg_id)
+
+    # 0. Attempt group-scope deactivation (best-effort; NiFi will handle ordering)
+    try:
+        _http(
+            "put",
+            f"{nifi}/flow/process-groups/{pg_id}/controller-services",
+            hdr,
+            {"id": pg_id, "state": "DISABLED"},
+            verify_ssl=verify_ssl,
+        )
+    except DeployError as e:
+        LOG.debug("Group-scope deactivate returned: %s", e)
+
+    # 1. Iterate + send DISABLED to any remaining ENABLED services (descendants included)
+    deadline = time.time() + timeout_secs
+    while True:
+        listing = _http(
+            "get",
+            f"{nifi}/flow/process-groups/{pg_id}/controller-services"
+            f"?includeAncestorGroups=false&includeDescendantGroups=true",
+            hdr,
+            verify_ssl=verify_ssl,
+        )
+        items = listing.get("controllerServices", [])
+        if not items:
+            LOG.info("No controller-services under target group.")
+            return
+
+        not_disabled = []
+        for cs in items:
+            comp = cs["component"]
+            state = comp.get("state")
+            if state != "DISABLED":
+                not_disabled.append(comp["id"])
+                # best-effort individual disable
+                rev = cs["revision"]
+                body = {
+                    "revision": {"clientId": rev.get("clientId") or str(uuid.uuid4()),
+                                 "version":  rev["version"]},
+                    "component": {"id": comp["id"], "state": "DISABLED"},
+                }
+                try:
+                    _http("put", f"{nifi}/controller-services/{comp['id']}", hdr, body, verify_ssl=verify_ssl)
+                except DeployError as e:
+                    LOG.debug("Disable CS %s failed (will retry/poll): %s", comp.get("name"), e)
+
+        # 2. Poll until all show DISABLED
+        done = True
+        after = _http(
+            "get",
+            f"{nifi}/flow/process-groups/{pg_id}/controller-services"
+            f"?includeAncestorGroups=false&includeDescendantGroups=true",
+            hdr,
+            verify_ssl=verify_ssl,
+        ).get("controllerServices", [])
+        for cs in after:
+            if cs["component"].get("state") != "DISABLED":
+                done = False
+                break
+
+        if done:
+            LOG.info("All controller-services DISABLED.")
+            return
+
+        if time.time() > deadline:
+            raise DeployError("Timeout: controller services not all disabled")
+        time.sleep(poll_secs)
+
 
 def nifi_upgrade_pg_deleteme(nifi, pg_id, reg_id, bucket_id, flow_id, version, hdr, ssl):
     body = {
@@ -600,6 +692,72 @@ def nifi_upgrade_pg_deleteme(nifi, pg_id, reg_id, bucket_id, flow_id, version, h
             _http("delete", f"{nifi}/versions/update-requests/{rid}", hdr, verify_ssl=ssl)
             break
     LOG.info("PG %s upgraded to version %s", pg_id, version)
+
+
+# --- Queue drain / PG delete helpers ---------------------------------------
+def nifi_drop_all_queues(nifi, pg_id, hdr, verify_ssl=True, poll_secs=2, timeout_secs=300):
+    LOG.info("Dropping all queues in PG %s …", pg_id)
+    req = _http(
+        "post",
+        f"{nifi}/process-groups/{pg_id}/empty-all-connections-requests",
+        hdr,
+        verify_ssl=verify_ssl,
+    )
+    drop = req.get("dropRequest") or req
+    drop_id = drop.get("id") or (drop.get("dropRequest") or {}).get("id")
+    if not drop_id:
+        raise DeployError("Could not obtain queue drop-request id")
+
+    deadline = time.time() + timeout_secs
+    try:
+        while True:
+            stat = _http(
+                "get",
+                f"{nifi}/process-groups/{pg_id}/empty-all-connections-requests/{drop_id}",
+                hdr,
+                verify_ssl=verify_ssl,
+            )
+            dr = stat.get("dropRequest") or stat
+            pct = dr.get("percentCompleted")
+            finished = dr.get("finished")
+            LOG.debug("Queue drop status: %s%%", pct)
+            if finished:
+                if dr.get("failureReason"):
+                    raise DeployError("Queue drop failed: " + dr["failureReason"])
+                LOG.info("All queues dropped.")
+                break
+
+            if time.time() > deadline:
+                raise DeployError("Timeout while dropping connection queues")
+            time.sleep(poll_secs)
+    finally:
+        # best-effort cleanup of request
+        try:
+            _http(
+                "delete",
+                f"{nifi}/process-groups/{pg_id}/empty-all-connections-requests/{drop_id}",
+                hdr,
+                verify_ssl=verify_ssl,
+            )
+        except DeployError:
+            pass
+
+
+def nifi_delete_pg(nifi, pg_id, hdr, verify_ssl=True):
+    ent = _http("get", f"{nifi}/process-groups/{pg_id}", hdr, verify_ssl=verify_ssl)
+    rev = ent["revision"]
+    name = (ent.get("component") or {}).get("name", "")
+    version = rev["version"]
+    client_id = str(uuid.uuid4())
+    LOG.info("Deleting PG '%s' (%s) …", name, pg_id)
+    _http(
+        "delete",
+        f"{nifi}/process-groups/{pg_id}?version={version}&clientId={client_id}",
+        hdr,
+        verify_ssl=verify_ssl,
+    )
+    LOG.info("PG '%s' deleted", name)
+    return name
 
 
 # ---------- CLI parsing -----------------------------------------------------
@@ -654,6 +812,10 @@ def parser():
     for cmd in ("start-flow", "stop-flow"):
         s = sub.add_parser(cmd)
         s.add_argument("--name", required=True)
+
+    # --- NEW: cleanup ----------------------------------------------------
+    s = sub.add_parser("cleanup", help="Disable CS, stop PG, drop queues, delete PG and matching Registry bucket")
+    s.add_argument("--name", required=True, help="Process Group name to clean up")
 
     return p
 
@@ -818,6 +980,37 @@ def main():
             raise DeployError("PG not found")
         new_state = "RUNNING" if args.cmd == "start-flow" else "STOPPED"
         nifi_schedule_pg(nifi, pg_id, new_state, nifi_hdr, ssl)
+        return
+
+    # -- cleanup -------------------------------------------------------------
+    if args.cmd == "cleanup":
+        pg_id = nifi_search_pg(nifi, args.name, nifi_hdr, ssl)
+        if not pg_id:
+            raise DeployError("PG not found")
+
+        # 1) Try to disable controller services first
+        try:
+            disable_controller_services(nifi, pg_id, nifi_hdr, ssl, poll_secs=2, timeout_secs=90)
+        except DeployError as e:
+            LOG.warning("Could not fully disable controller services before stopping PG (%s). Proceeding to stop PG, then retry.", e)
+
+        # 2) Stop the process group
+        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl)
+
+        # 2b) Retry CS disable in case referencing components prevented it earlier
+        try:
+            disable_controller_services(nifi, pg_id, nifi_hdr, ssl, poll_secs=2, timeout_secs=60)
+        except DeployError as e:
+            LOG.warning("Controller services still not all disabled; continuing with cleanup: %s", e)
+
+        # 3) Empty all queues
+        nifi_drop_all_queues(nifi, pg_id, nifi_hdr, ssl, poll_secs=2, timeout_secs=300)
+
+        # 4) Delete the process group (capture name for registry bucket)
+        pg_name = nifi_delete_pg(nifi, pg_id, nifi_hdr, ssl)
+
+        # 5) Delete matching registry bucket (name == PG name)
+        reg_delete_bucket_by_name(reg, pg_name, reg_hdr, ssl)
         return
 
 
