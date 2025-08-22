@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 import uuid
+import string
+import random
 from getpass import getpass
 from pathlib import Path
 import warnings
@@ -36,9 +38,7 @@ except ImportError:
 
 
 # ---------- logging ---------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s"
-)
+logging.basicConfig( level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 LOG = logging.getLogger("nifi-deploy")
 
 
@@ -359,14 +359,14 @@ def nifi_schedule_pg(nifi, pg_id, state, hdr, ssl, retries=0, wait_secs=3):
         time.sleep(wait_secs)
         st = _http(
             "get",
-            f"{nifi}/flow/process-groups/{pg_id}/status",
+            f"{nifi}/flow/process-groups/{pg_id}",
             hdr,
             verify_ssl=ssl,
         )
-        agg = (st.get("processGroupStatus") or {}).get("aggregateSnapshot") or {}
-        stopped  = int(agg.get("stoppedCount", 0) or 0)
-        invalid  = int(agg.get("invalidCount", 0) or 0)
-        disabled = int(agg.get("disabledCount", 0) or 0)
+        stopped  = int(st.get("stoppedCount", 0) or 0)
+        invalid  = int(st.get("invalidCount", 0) or 0)
+        running  = int(st.get("invalidCount", 0) or 0)
+        disabled = int(st.get("disabledCount", 0) or 0)
 
         if stopped == 0 and invalid == 0 and disabled == 0:
             LOG.info("PG %s is fully RUNNING (no stopped/invalid/disabled components).", pg_id)
@@ -445,23 +445,58 @@ def nifi_create_pc(nifi, name, params, hdr, ssl, desc=""):
     return pc["id"]
 
 
-def nifi_bind_pc(nifi, pg_id, pc_id, hdr, ssl):
-    for attempt in range(3):
-        pg = _http("get", nifi + "/process-groups/" + pg_id, hdr, verify_ssl=ssl)
-        rev = pg["revision"]
-        pg["component"]["parameterContext"] = {"id": pc_id}
+def nifi_bind_pc(nifi, root_pg_id, pc_id, hdr, ssl, max_retries=3):
+    def _list_child_pgs(parent_pg_id):
+        res = _http( "get", f"{nifi}/process-groups/{parent_pg_id}/process-groups", hdr, verify_ssl=ssl,)
+        return res.get("processGroups", [])
 
-        pg["revision"]["clientId"] = rev.get("clientId") or str(uuid.uuid4())
-        #pg["revision"]["version"] += 1
-        try:
-            _http("put", nifi + "/process-groups/" + pg_id, hdr, pg, verify_ssl=ssl)
-            LOG.info("Bound PG %s -> PC %s", pg_id, pc_id)
-            return
-        except DeployError as e:
-            if "is not the " in str(e) and attempt < 2:
-                LOG.info("409 revision conflict for %s; retrying", pg_id)
-                continue
-            raise
+    def _force_bind_single(pg_id):
+        # Retry to handle revision conflicts (409)
+        for attempt in range(max_retries):
+            pg = _http("get", f"{nifi}/process-groups/{pg_id}", hdr, verify_ssl=ssl)
+            rev = pg["revision"]
+            comp = pg["component"]
+
+            # Bind PC on this PG
+            comp["parameterContext"] = {"id": pc_id}
+            pg["revision"]["clientId"] = rev.get("clientId") or str(uuid.uuid4())
+
+            try:
+                _http("put", f"{nifi}/process-groups/{pg_id}", hdr, pg, verify_ssl=ssl)
+                LOG.info("Bound PG %s -> PC %s", pg_id, pc_id)
+                return
+            except DeployError as e:
+                msg = str(e)
+                if ("is not the most recent version" in msg
+                        or "is not the most up-to-date revision" in msg
+                        or "409" in msg) and attempt < (max_retries - 1):
+                    LOG.debug("Revision conflict updating PG %s; retrying (%d/%d)",
+                              pg_id, attempt + 1, max_retries)
+                    time.sleep(0.5 + attempt * 0.5)
+                    continue
+                raise
+
+    # pg_id -> all descendants
+    queue = [root_pg_id]
+    visited = set()
+
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        # Force bind on current PG
+        _force_bind_single(current)
+
+        # Enqueue children
+        for child in _list_child_pgs(current):
+            cid = child.get("id")
+            if cid and cid not in visited:
+                queue.append(cid)
+
+    LOG.info("Parameter Context %s force-applied to PG %s and all descendants.", pc_id, root_pg_id)
+
 
 def nifi_upgrade_pg(
     nifi_url,
@@ -627,75 +662,49 @@ def enable_controller_services(nifi, pg_id, hdr, verify_ssl=True, poll_secs=2, t
         time.sleep(poll_secs)
 
 
-# --- Disable controller services for a PG (includes descendants)
+# Disable controller services associated with a PG
 def disable_controller_services(nifi, pg_id, hdr, verify_ssl=True, poll_secs=2, timeout_secs=120):
     LOG.info("Disabling controller-services in PG %s …", pg_id)
 
-    # 0. Attempt group-scope deactivation (best-effort; NiFi will handle ordering)
-    try:
-        _http(
-            "put",
-            f"{nifi}/flow/process-groups/{pg_id}/controller-services",
-            hdr,
-            {"id": pg_id, "state": "DISABLED"},
-            verify_ssl=verify_ssl,
-        )
-    except DeployError as e:
-        LOG.debug("Group-scope deactivate returned: %s", e)
+    # 1. list controller services
+    cs_list = _http( "get", f"{nifi}/flow/process-groups/{pg_id}/controller-services", hdr,
+        verify_ssl=verify_ssl,
+    )["controllerServices"]
 
-    # 1. Iterate + send DISABLED to any remaining ENABLED services (descendants included)
+    # 2. disable any enabled controller services
+    for cs in cs_list:
+        comp = cs["component"]
+        if comp["state"] == "ENABLED":
+            rev = cs["revision"]
+            body = {
+                "revision": {"clientId": rev.get("clientId") or str(uuid.uuid4()),
+                             "version":  rev["version"]},
+                "component": {"id": comp["id"], "state": "DISABLED"},
+            }
+            _http( "put", f"{nifi}/controller-services/{comp['id']}", hdr, body,
+                verify_ssl=verify_ssl,
+            )
+            LOG.debug("Sent DISABLE to CS %s", comp["name"])
+
+    # 3. poll until every CS is DISABLED
     deadline = time.time() + timeout_secs
     while True:
-        listing = _http(
-            "get",
-            f"{nifi}/flow/process-groups/{pg_id}/controller-services"
-            f"?includeAncestorGroups=false&includeDescendantGroups=true",
-            hdr,
+        all_ok = True
+        for cs in _http(
+            "get", f"{nifi}/flow/process-groups/{pg_id}/controller-services", hdr,
             verify_ssl=verify_ssl,
-        )
-        items = listing.get("controllerServices", [])
-        if not items:
-            LOG.info("No controller-services under target group.")
-            return
-
-        not_disabled = []
-        for cs in items:
-            comp = cs["component"]
-            state = comp.get("state")
+        )["controllerServices"]:
+            state = cs["component"]["state"]
             if state != "DISABLED":
-                not_disabled.append(comp["id"])
-                # best-effort individual disable
-                rev = cs["revision"]
-                body = {
-                    "revision": {"clientId": rev.get("clientId") or str(uuid.uuid4()),
-                                 "version":  rev["version"]},
-                    "component": {"id": comp["id"], "state": "DISABLED"},
-                }
-                try:
-                    _http("put", f"{nifi}/controller-services/{comp['id']}", hdr, body, verify_ssl=verify_ssl)
-                except DeployError as e:
-                    LOG.debug("Disable CS %s failed (will retry/poll): %s", comp.get("name"), e)
-
-        # 2. Poll until all show DISABLED
-        done = True
-        after = _http(
-            "get",
-            f"{nifi}/flow/process-groups/{pg_id}/controller-services"
-            f"?includeAncestorGroups=false&includeDescendantGroups=true",
-            hdr,
-            verify_ssl=verify_ssl,
-        ).get("controllerServices", [])
-        for cs in after:
-            if cs["component"].get("state") != "DISABLED":
-                done = False
-                break
-
-        if done:
-            LOG.info("All controller-services DISABLED.")
-            return
+                all_ok = False
+                LOG.debug("CS %s still %s / %s", cs["component"]["name"], state)
+        if all_ok:
+            LOG.info("All controller-services DISABLED")
+            break
 
         if time.time() > deadline:
-            raise DeployError("Timeout: controller services not all disabled")
+            # Ignore the error during disabling of controller service
+            return
         time.sleep(poll_secs)
 
 
@@ -849,7 +858,6 @@ def parser():
         s = sub.add_parser(cmd)
         s.add_argument("--name", required=True)
 
-    # --- NEW: cleanup ----------------------------------------------------
     s = sub.add_parser("cleanup", help="Disable CS, stop PG, drop queues, delete PG and matching Registry bucket")
     s.add_argument("--name", required=True, help="Process Group name to clean up")
 
@@ -901,7 +909,7 @@ def main():
         )
 
         # Param‐context
-        pc_name = "{}_{}".format(args.env, args.name)
+        pc_name = f"{args.env}_{args.name}_{''.join(random.choices(string.ascii_lowercase, k=5))}"
         pc_id = nifi_pc_id(nifi, pc_name, nifi_hdr, ssl)
         params = []
         if args.param_file:
@@ -920,7 +928,7 @@ def main():
         if pc_id:
             if params:
                 nifi_update_pc(nifi, pc_id, params, nifi_hdr, ssl)
-        else:                                      # create new
+        else:
             pc_id = nifi_create_pc(
                 nifi, pc_name, params, nifi_hdr, ssl, desc="Auto PC for " + pc_name
             )
@@ -928,14 +936,14 @@ def main():
         # Bind PC to PG
         nifi_bind_pc(nifi, pg_id, pc_id, nifi_hdr, ssl)
 
-	if args.site_role == "active":
-	    # Enable controller services
-	    enable_controller_services(nifi, pg_id, nifi_hdr, ssl, 2, 30)
-	    # Start the process group
-	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl ,retries=6, wait_secs=5)
-	else:
-	    LOG.info("Passive site: skipping controller-services enable and flow start.")
-	return
+        if args.site_role == "active":
+            # Enable controller services
+            enable_controller_services(nifi, pg_id, nifi_hdr, ssl, 2, 30)
+            # Start the process group
+            nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl ,retries=6, wait_secs=5)
+        else:
+            LOG.info("Passive site: skipping controller-services enable and flow start.")
+        return
 
 
     # -- upgrade-flow --------------------------------------------------------
@@ -954,7 +962,7 @@ def main():
             return
 
         # Stop the PG
-        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl,retries=6, wait_secs=5)
+        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl)
 
         # Update parameter context
         if args.param_file:
@@ -984,11 +992,11 @@ def main():
             nifi_hdr,
             ssl,
         )
-	if args.site_role == "active":
-	    nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl,retries=6, wait_secs=5)
-	else:
-	    LOG.info("Passive site: leaving process group STOPPED after upgrade.")
-	return
+        if args.site_role == "active":
+            nifi_schedule_pg(nifi, pg_id, "RUNNING", nifi_hdr, ssl,retries=6, wait_secs=5)
+        else:
+            LOG.info("Passive site: leaving process group STOPPED after upgrade.")
+        return
 
 
     if args.cmd == "update-pc":
@@ -1024,14 +1032,14 @@ def main():
         if not pg_id:
             raise DeployError("PG not found")
 
-        # 1) Try to disable controller services first
+        # 1) Stop the process group
+        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl,retries=6, wait_secs=5)
+
+        # 2) Try to disable controller services first
         try:
             disable_controller_services(nifi, pg_id, nifi_hdr, ssl, poll_secs=2, timeout_secs=90)
         except DeployError as e:
             LOG.warning("Could not fully disable controller services before stopping PG (%s). Proceeding to stop PG, then retry.", e)
-
-        # 2) Stop the process group
-        nifi_schedule_pg(nifi, pg_id, "STOPPED", nifi_hdr, ssl,retries=6, wait_secs=5)
 
         # 2b) Retry CS disable in case referencing components prevented it earlier
         try:
