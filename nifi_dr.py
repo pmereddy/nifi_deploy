@@ -14,13 +14,7 @@ Working:
        b. if force flag is enabled, stop immediately
        c. Otherwise, do a graceful stop, verify the process group is stopped and there are no queued or active flow files
        d. start the flow on current standby
-
-TODO:
-    1. Verify that standby is not running before proceeding with failover
-    2. Do a delayed retry for upto a few min for quiese state
-    3. When promoting, lets make sure the controller services are enabled
-    4. pg_id for primary and standby could be different.
-
+       e. update the site_role parameter of the active parameter context
 
 """
 
