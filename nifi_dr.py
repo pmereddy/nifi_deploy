@@ -390,6 +390,14 @@ def do_failover(active_url, standby_url, active_pg_id, standby_pg_id,
         raise DeployError("Stand-by PG failed to start (state=%s)" % state)
     LOG.info("SUCCESS: Promoted standby to active :%s", standby_url)
 
+    # --- Flip parameter context site_role on both sites now that promotion succeeded
+    try:
+        flip_res = set_site_roles_both_sites(active_url, standby_url, active_pg_id, standby_pg_id,
+                                             hdr_act, hdr_sb, verify_ssl=verify_ssl)
+        LOG.info("Updated site_role on parameter contexts: %s", json.dumps(flip_res))
+    except Exception as e:
+        LOG.warning("Failover succeeded but updating 'site_role' failed: %s", e)
+
 def parser():
     p = argparse.ArgumentParser(description="NiFi DR fail-over CLI")
     p.add_argument("-v", "--debug", action="count", default=0)
@@ -413,9 +421,111 @@ def parser():
 
     s = sub.add_parser("status")
 
+
+    r = sub.add_parser("set-site-roles", help="Set parameter 'site_role' to active/passive on the two sites for the selected Process Group")
     return p
 
 # --------------------------------------------------------------------------
+
+# ------------------- Parameter Context: site_role helpers ------------------
+
+def _load_pg(nifi, pg_id, hdr, verify_ssl=True):
+    """Return Process Group entity (component + revision)."""
+    return _http("get", f"{nifi}/process-groups/{pg_id}", hdr, verify_ssl=verify_ssl)
+
+def _load_parameter_context(nifi, pc_id, hdr, verify_ssl=True):
+    """Return Parameter Context entity."""
+    return _http("get", f"{nifi}/parameter-contexts/{pc_id}", hdr, verify_ssl=verify_ssl)
+
+def _put_parameter_context(nifi, pc_entity, hdr, verify_ssl=True):
+    """PUT the Parameter Context entity back (NiFi requires full component + revision)."""
+    pc_id = pc_entity["component"]["id"]
+    return _http("put", f"{nifi}/parameter-contexts/{pc_id}", hdr, json_body={
+        "revision": pc_entity["revision"],
+        "component": pc_entity["component"],
+    }, verify_ssl=verify_ssl)
+
+def set_site_role_for_pg(nifi, pg_id, hdr, verify_ssl=True, *, role: str, description: str = "Role of this site in active/passive DR"):
+    """
+    Ensure the parameter `site_role` exists on the parameter context assigned to the given Process Group
+    and set it to the given role ('active' or 'passive').
+
+    Returns a dict summary with old/new values and revision.
+    """
+    role_norm = str(role).strip().lower()
+    if role_norm not in ("active", "passive"):
+        raise DeployError("role must be 'active' or 'passive'")
+
+    # 1) Discover the PG's parameter context
+    pg = _load_pg(nifi, pg_id, hdr, verify_ssl=verify_ssl)
+    pc_ref = pg.get("component", {}).get("parameterContext")
+    if not pc_ref or "id" not in pc_ref:
+        raise DeployError(f"Process Group {pg_id} does not have a parameter context assigned.")
+
+    pc_id = pc_ref["id"]
+    # 2) Load full parameter context
+    pc_entity = _load_parameter_context(nifi, pc_id, hdr, verify_ssl=verify_ssl)
+
+    params_list = pc_entity["component"].get("parameters") or []
+    # Convert to dict by name
+    by_name = {}
+    for entry in params_list:
+        param = entry.get("parameter", {})
+        name = param.get("name")
+        if name:
+            by_name[name] = entry
+
+    old_val = None
+    if "site_role" in by_name:
+        old_val = by_name["site_role"]["parameter"].get("value")
+        by_name["site_role"]["parameter"]["value"] = role_norm
+        by_name["site_role"]["parameter"]["sensitive"] = False
+        if description is not None:
+            by_name["site_role"]["parameter"]["description"] = description
+    else:
+        new_entry = {
+            "parameter": {
+                "name": "site_role",
+                "value": role_norm,
+                "sensitive": False,
+            }
+        }
+        if description is not None:
+            new_entry["parameter"]["description"] = description
+        by_name["site_role"] = new_entry
+
+    # Rebuild ordered list (preserve existing order where possible, append new if needed)
+    names_seen = [e.get("parameter", {}).get("name") for e in params_list if e.get("parameter")]
+    new_list = []
+    seen_set = set()
+    for nm in names_seen:
+        if nm in by_name and nm not in seen_set:
+            new_list.append(by_name[nm])
+            seen_set.add(nm)
+    # Append any new names (like site_role) not present before
+    for nm, entry in by_name.items():
+        if nm not in seen_set:
+            new_list.append(entry)
+
+    pc_entity["component"]["parameters"] = new_list
+    updated = _put_parameter_context(nifi, pc_entity, hdr, verify_ssl=verify_ssl)
+
+    return {
+        "parameterContextId": pc_id,
+        "parameterContextName": updated["component"].get("name"),
+        "oldValue": old_val,
+        "newValue": role_norm,
+        "revisionVersion": updated["revision"]["version"],
+    }
+
+def set_site_roles_both_sites(active_nifi, standby_nifi, active_pg_id, standby_pg_id, hdr_act, hdr_sb, verify_ssl=True):
+    """Set site_role=active on the active site and site_role=passive on the standby site for the given PG IDs.
+    Returns a dict with 'active' and 'standby' results.
+    """
+    res_active = set_site_role_for_pg(active_nifi, active_pg_id, hdr_act, verify_ssl=verify_ssl, role="active")
+    res_passive = set_site_role_for_pg(standby_nifi, standby_pg_id, hdr_sb, verify_ssl=verify_ssl, role="passive")
+    return {"active": res_active, "standby": res_passive}
+
 def main():
     args = parser().parse_args()
     if args.debug:
@@ -438,6 +548,11 @@ def main():
             "active":  {"url": act, "state": sa[0], "queued": sa[1], "threads": sa[3]},
             "standby": {"url": sb,  "state": ss[0], "queued": ss[1], "threads": ss[3]},
         }, indent=2))
+    
+    elif args.cmd == "set-site-roles":
+        # Update site_role on both clusters
+        results = set_site_roles_both_sites(act, sb, active_pg_id, standby_pg_id, hdr_act, hdr_sb, verify_ssl=verify)
+        print(json.dumps(results, indent=2))
     elif args.cmd == "failover":
         do_failover(act, sb, active_pg_id, standby_pg_id, hdr_act, hdr_sb,
                     verify_ssl=verify, force=args.force,
