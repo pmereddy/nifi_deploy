@@ -376,6 +376,14 @@ def do_failover(active_url, standby_url, active_pg_id, standby_pg_id,
         verify_pg_quiesced(active_url, active_pg_id, hdr_act, verify_ssl)
         LOG.info("SUCCESS: Stopped app:%s on active site :%s", active_pg_id, active_url)
 
+    # --- Flip parameter context site_role on both sites
+    try:
+        flip_res = set_site_roles_both_sites(active_url, standby_url, active_pg_id, standby_pg_id,
+                                             hdr_act, hdr_sb, verify_ssl=verify_ssl)
+        LOG.info("Updated site_role on parameter contexts: %s", json.dumps(flip_res))
+    except Exception as e:
+        LOG.warning("updating 'site_role' failed: %s", e)
+
     # start app on the standby side
     enable_controller_services(standby_url, standby_pg_id, hdr_sb, verify_ssl, 2, 30)
     nifi_schedule_pg(standby_url, standby_pg_id, "RUNNING", hdr_sb, verify_ssl)
@@ -383,14 +391,6 @@ def do_failover(active_url, standby_url, active_pg_id, standby_pg_id,
     if state != "RUNNING":
         raise DeployError("Stand-by PG failed to start (state=%s)" % state)
     LOG.info("SUCCESS: Promoted standby to active :%s", standby_url)
-
-    # --- Flip parameter context site_role on both sites now that promotion succeeded
-    try:
-        flip_res = set_site_roles_both_sites(active_url, standby_url, active_pg_id, standby_pg_id,
-                                             hdr_act, hdr_sb, verify_ssl=verify_ssl)
-        LOG.info("Updated site_role on parameter contexts: %s", json.dumps(flip_res))
-    except Exception as e:
-        LOG.warning("Failover succeeded but updating 'site_role' failed: %s", e)
 
 def parser():
     p = argparse.ArgumentParser(description="NiFi DR fail-over CLI")
@@ -433,8 +433,16 @@ def _load_parameter_context(nifi, pc_id, hdr, verify_ssl=True):
 
 def _put_parameter_context(nifi, pc_entity, hdr, verify_ssl=True):
     """PUT the Parameter Context entity back (NiFi requires full component + revision)."""
-    pc_id = pc_entity["component"]["id"]
+    pc_id = pc_entity.get("id") or pc_entity.get("component", {}).get("id")
+    if not pc_id:
+        raise DeployError("Parameter context entity missing id ")
+
+    pc_entity.setdefault("component",{})
+    pc_entity["id"] = pc_id
+    pc_entity["component"]["id"] = pc_id
+
     return _http("put", f"{nifi}/parameter-contexts/{pc_id}", hdr, json_body={
+        "id": pc_id,
         "revision": pc_entity["revision"],
         "component": pc_entity["component"],
     }, verify_ssl=verify_ssl)
@@ -502,6 +510,9 @@ def set_site_role_for_pg(nifi, pg_id, hdr, verify_ssl=True, *, role: str, descri
             new_list.append(entry)
 
     pc_entity["component"]["parameters"] = new_list
+    pc_entity["id"] = pc_entity.get("id") or pc_id
+    pc_entity.setdefault("component", {})
+    pc_entity["component"]["id"] = pc_id
     updated = _put_parameter_context(nifi, pc_entity, hdr, verify_ssl=verify_ssl)
 
     return {
@@ -513,11 +524,11 @@ def set_site_role_for_pg(nifi, pg_id, hdr, verify_ssl=True, *, role: str, descri
     }
 
 def set_site_roles_both_sites(active_nifi, standby_nifi, active_pg_id, standby_pg_id, hdr_act, hdr_sb, verify_ssl=True):
-    """Set site_role=active on the active site and site_role=passive on the standby site for the given PG IDs.
-    Returns a dict with 'active' and 'standby' results.
+    """Set site_role=passive on the current active site and site_role=active on the current standby site
+    for the given PG IDs. Returns a dict with 'active' and 'standby' results.
     """
-    res_active = set_site_role_for_pg(active_nifi, active_pg_id, hdr_act, verify_ssl=verify_ssl, role="active")
-    res_passive = set_site_role_for_pg(standby_nifi, standby_pg_id, hdr_sb, verify_ssl=verify_ssl, role="passive")
+    res_active = set_site_role_for_pg(active_nifi, active_pg_id, hdr_act, verify_ssl=verify_ssl, role="passive")
+    res_passive = set_site_role_for_pg(standby_nifi, standby_pg_id, hdr_sb, verify_ssl=verify_ssl, role="active")
     return {"active": res_active, "standby": res_passive}
 
 def main():
@@ -542,7 +553,7 @@ def main():
             "active":  {"url": act, "state": sa[0], "queued": sa[1], "threads": sa[3]},
             "standby": {"url": sb,  "state": ss[0], "queued": ss[1], "threads": ss[3]},
         }, indent=2))
-    
+
     elif args.cmd == "set-site-roles":
         # Update site_role on both clusters
         results = set_site_roles_both_sites(act, sb, active_pg_id, standby_pg_id, hdr_act, hdr_sb, verify_ssl=verify)
